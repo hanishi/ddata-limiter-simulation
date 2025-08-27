@@ -1,5 +1,6 @@
 package com.example
 
+import org.apache.pekko.actor.Address
 import org.apache.pekko.actor.typed.scaladsl.Behaviors
 import org.apache.pekko.actor.typed.{ ActorRef, Behavior }
 import org.apache.pekko.cluster.ddata.typed.scaladsl.{ DistributedData, Replicator }
@@ -9,12 +10,34 @@ import org.apache.pekko.cluster.ddata.{
   ReplicatedData,
   SelfUniqueAddress
 }
+import org.apache.pekko.cluster.typed.Cluster
 
+import java.lang.management.{ ManagementFactory, MemoryMXBean }
 import scala.concurrent.duration.*
 
 object RateLimiterDData {
   def apply(prefix: String, settings: Settings): Behavior[Command] = Behaviors.setup { ctx =>
+    require(
+      settings.buckets > 0 && (settings.buckets & (settings.buckets - 1)) == 0,
+      "buckets must be a power of two"
+    )
+    require(settings.keepWindows >= 1, "keepWindows must be >= 1")
+    require(settings.windowMs > 0, "windowMs must be > 0")
+    require(settings.capacity >= 0, "capacity must be >= 0")
+    require(settings.maxKeysPerBucket > 0, "maxKeysPerBucket must be > 0")
+    require(settings.deleteBatchPerTick >= 0, "deleteBatchPerTick must be >= 0")
+    require(settings.sweepEvery > Duration.Zero, "sweepEvery must be > 0")
+    require(settings.deleteTimeout >= Duration.Zero, "deleteTimeout must be >= 0")
+
     given SelfUniqueAddress = DistributedData(ctx.system).selfUniqueAddress
+
+    val cluster: Cluster = Cluster(ctx.system)
+
+    val memoryMBean: MemoryMXBean = ManagementFactory.getMemoryMXBean
+
+    val deleteConsistency = Replicator.WriteMajority(settings.deleteTimeout)
+
+    def nodeKey(address: Address): String = address.host.get + ":" + address.port.get
 
     def wid(now: Long) = now / settings.windowMs
 
@@ -28,6 +51,8 @@ object RateLimiterDData {
         case _ => false
       }
 
+    val node = nodeKey(cluster.selfMember.address)
+
     Behaviors.withTimers { timers =>
       timers.startTimerAtFixedRate(Tick, settings.sweepEvery)
 
@@ -39,10 +64,10 @@ object RateLimiterDData {
             val b   = bucketOf(k)
             repl.askGet(
               ask => Replicator.Get(keyOf(w, b), Replicator.ReadLocal, ask),
-              rsp => GotGet(k, w, b, rsp, replyTo)
+              rsp => InternalGetResponse(k, w, b, rsp, replyTo)
             )
             Behaviors.same
-          case GotGet(k, w, b, rsp, replyTo) => // compute key from window+bucket
+          case InternalGetResponse(k, w, b, rsp, replyTo) => // compute key from window+bucket
             val key = keyOf(w, b)
             // current: the current counter-value for a key in this bucket
             // distinct: the number of distinct keys recorded in this bucket
@@ -67,16 +92,9 @@ object RateLimiterDData {
                 case _ => (0, 0) // no value yet, so both counts and distinct keys are zero
               } // if the current counter-value for this key is already at or above capacity, reject
             if (current >= settings.capacity) {
-//              ctx.log.debug("DENY capacity key={} current={} cap={}", k, current, cfg.capacity)
               replyTo ! false
               Behaviors.same // if the number of distinct keys in this bucket is at or above maxKeysPerBucket, and this key is not yet present (current == 0), reject
             } else if (distinct >= settings.maxKeysPerBucket && current == 0) {
-//              ctx.log.debug(
-//                "DENY distinct-cap key={} distinct={} cap={}",
-//                k,
-//                distinct,
-//                cfg.maxKeysPerBucket
-//              )
               replyTo ! false
               Behaviors.same // otherwise, increment the counter for this key
             } else {
@@ -88,58 +106,35 @@ object RateLimiterDData {
                   Replicator.Update(key, PNCounterMap.empty[String], wc, ask)(
                     _.incrementBy(k, 1)
                   ),
-                rsp => GotUpd(w, b, rsp, replyTo)
+                rsp => InternalUpdateResponse(w, b, rsp, replyTo)
               )
               Behaviors.same
             }
           case Tick => // rotation by *not reading old windows*; no per-entry removals
             // We only handle current/previous windows. Older windows are safe to delete.
-            val nowW        = wid(System.currentTimeMillis())
-            val purgeBefore = nowW - (settings.keepWindows - 1).max(1) // keep at least current
-            // Throttle how many keys we delete this sweep:
-            var budget = settings.deleteBatchPerTick
+            val nowW         = wid(System.currentTimeMillis())
+            val oldestToKeep = nowW - (settings.keepWindows - 1).max(0)
 
-            var b = 0
-            var w = purgeBefore - 1 // Delete oldest first, stop when budget is spent.
-            while (budget > 0 && w >= 0) {
-              while (budget > 0 && b < settings.buckets) {
-                val k  = keyOf(w, b)
-                val wc = Replicator.WriteMajority(settings.deleteTimeout)
-//                  ctx.log.info(
-//                    "askDelete scheduling window={} bucket={} key={}",
-//                    Long.box(w),
-//                    Int.box(b),
-//                    keyOf(w, b).id
-//                  )
-                repl.askDelete(ask => Replicator.Delete(k, wc, ask), rsp => GotDel(w, b, rsp))
-                budget -= 1
-                b += 1
+            val pairs = Iterator
+              .iterate((oldestToKeep - 1, 0)) { case (w, b) =>
+                if (b + 1 < settings.buckets) (w, b + 1) else (w - 1, 0)
               }
-              w -= 1
-              b = 0
+              .takeWhile { case (w, _) => w >= 0 }
+              .take(settings.deleteBatchPerTick)
+
+            pairs.foreach { case (w, b) =>
+              repl.askDelete(
+                ask =>
+                  Replicator
+                    .Delete(keyOf(w, b), deleteConsistency, ask),
+                rsp => InternalDeleteResponse(w, b, rsp)
+              )
             }
             Behaviors.same
-          case GotUpd(_, _, rsp, replyTo) =>
+          case InternalUpdateResponse(_, _, rsp, replyTo) =>
             replyTo ! updateSucceeded(rsp)
             Behaviors.same
-          case GotDel(wi, bi, rsp) =>
-//              rsp match {
-//                case _: Replicator.DeleteSuccess[_] =>
-//                  ctx.log.info("askDelete SUCCESS window={} bucket={}", Long.box(wi), Int.box(bi))
-//                case _: Replicator.DataDeleted[_] =>
-//                  ctx.log.info(
-//                    "askDelete DATA_DELETED (already gone) window={} bucket={}",
-//                    Long.box(wi),
-//                    Int.box(bi)
-//                  )
-//                case other =>
-//                  ctx.log.warn(
-//                    "askDelete NON-FINAL rsp={} window={} bucket={}",
-//                    other.getClass.getSimpleName,
-//                    Long.box(wi),
-//                    Int.box(bi)
-//                  )
-//              }
+          case InternalDeleteResponse(wi, bi, rsp) =>
             Behaviors.same
         }
       }
@@ -162,7 +157,7 @@ object RateLimiterDData {
 
   final case class Allow(key: String, replyTo: ActorRef[Boolean]) extends Command
 
-  private final case class GotGet(
+  private final case class InternalGetResponse(
       k: String,
       w: Long,
       b: Int,
@@ -170,14 +165,14 @@ object RateLimiterDData {
       replyTo: ActorRef[Boolean]
   ) extends Command
 
-  private final case class GotUpd(
+  private final case class InternalUpdateResponse(
       w: Long,
       b: Int,
       rsp: Replicator.UpdateResponse[PNCounterMap[String]],
       replyTo: ActorRef[Boolean]
   ) extends Command
 
-  private final case class GotDel(
+  private final case class InternalDeleteResponse(
       w: Long,
       b: Int,
       rsp: Replicator.DeleteResponse[PNCounterMap[String]]

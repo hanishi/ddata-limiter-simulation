@@ -35,7 +35,7 @@ object Driver {
         prefix = "ddata-rate-limiter",
         settings = RateLimiterDData.Settings(
           capacity = 1,
-          // Maximum allowed count per key per window.
+          // Maxiamum allowed count per key per window.
           // With capacity = 1, each unique key (e.g. "ip:1.2.3.4") can only be granted once per window.
           // The next attempt in the same window is denied.
 
