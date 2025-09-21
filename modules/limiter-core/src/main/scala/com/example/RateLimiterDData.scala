@@ -68,13 +68,13 @@ object RateLimiterDData {
             )
             Behaviors.same
           case InternalGetResponse(k, w, b, rsp, replyTo) => // compute key from window+bucket
-            val key = keyOf(w, b)
+            val shard = keyOf(w, b)
             // current: the current counter-value for a key in this bucket
             // distinct: the number of distinct keys recorded in this bucket
             val (current, distinct) =
               rsp match { // The Replicator responses, "I have a value for PNCounterMap[String] under this key!"
                 case g @ Replicator.GetSuccess(
-                      key
+                      `shard`
                     ) => //  so you call g.get(key) to extract the actual PNCounterMap[String] for which the keys are your rate-limiting keys
                   //  +-----------------+---------+
                   //  |      entryKey   |  count  |
@@ -84,26 +84,33 @@ object RateLimiterDData {
                   //  | "imp|pubA|slot1"|    1    |
                   //  | "imp|pubB|slot2"|    7    |
                   //  +-----------------+---------+
-                  val m = g.get(key)
+                  val m     = g.get(shard)
+                  val count = m.get(k).sum.toInt
+                  val keys  = m.entries.size
                   (
-                    m.get(k).sum.toInt, // here the sum is just a neat way to say BingInt(0) or the value of Option[BigInt]
-                    m.entries.size
-                  ) // how many distinct keys in this bucket
+                    count, // here the sum is just a neat way to say BingInt(0) or the value of Option[BigInt]
+                    keys // how many distinct keys in this bucket
+                  )
                 case _ => (0, 0) // no value yet, so both counts and distinct keys are zero
-              } // if the current counter-value for this key is already at or above capacity, reject
+              }
             if (current >= settings.capacity) {
+              ctx.log.info("shard: {}, key: {}, count {}, num of keys: {}", shard, k, current, distinct)
+              // if the current counter-value for this key is already at or above capacity, reject
               replyTo ! false
-              Behaviors.same // if the number of distinct keys in this bucket is at or above maxKeysPerBucket, and this key is not yet present (current == 0), reject
+              Behaviors.same
             } else if (distinct >= settings.maxKeysPerBucket && current == 0) {
+              // if the number of distinct keys in this bucket is at or above maxKeysPerBucket, and this key is not yet present (current == 0), reject
+              ctx.log.info("shard: {}, key: {}, count {}, num of keys: {} ‼️", shard, k, current, distinct)
               replyTo ! false
-              Behaviors.same // otherwise, increment the counter for this key
+              Behaviors.same
             } else {
+              // otherwise, increment the counter for this key
               val wc =
                 if (settings.writeMajority) Replicator.WriteMajority(timeout = 300.millis)
                 else Replicator.WriteLocal
               repl.askUpdate(
                 ask =>
-                  Replicator.Update(key, PNCounterMap.empty[String], wc, ask)(
+                  Replicator.Update(shard, PNCounterMap.empty[String], wc, ask)(
                     _.incrementBy(k, 1)
                   ),
                 rsp => InternalUpdateResponse(w, b, rsp, replyTo)

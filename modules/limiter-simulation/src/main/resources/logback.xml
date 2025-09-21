@@ -13,7 +13,7 @@
         <neverBlock>true</neverBlock>
         <appender-ref ref="STDOUT" />
     </appender>
-
+    <logger name="org.apache.pekko.cluster" level="OFF"/>
     <root level="INFO">
         <appender-ref ref="ASYNC"/>
     </root>

@@ -3,10 +3,12 @@ lazy val pekkoV = "1.1.5"
 
 lazy val commonSettings = Seq(
   libraryDependencies ++= Seq(
-    "org.apache.pekko" %% "pekko-actor-typed"           % pekkoV,
-    "org.apache.pekko" %% "pekko-cluster-typed"         % pekkoV,
-    "org.apache.pekko" %% "pekko-serialization-jackson" % pekkoV,
-    "ch.qos.logback"    % "logback-classic"             % "1.5.18"
+    "org.apache.pekko"   %% "pekko-actor-typed"            % pekkoV,
+    "org.apache.pekko"   %% "pekko-cluster-typed"          % pekkoV,
+    "org.apache.pekko"   %% "pekko-cluster-sharding-typed" % pekkoV,
+    "org.apache.pekko"   %% "pekko-serialization-jackson"  % pekkoV,
+    "ch.qos.logback"      % "logback-classic"              % "1.5.18",
+    "com.github.blemale" %% "scaffeine"                    % "5.3.0"
   )
 )
 
@@ -17,4 +19,8 @@ lazy val limiterCore = (project in file("modules/limiter-core"))
 lazy val limiterSim = (project in file("modules/limiter-simulation"))
   .dependsOn(limiterCore)
   .settings(commonSettings)
-  .settings(name := "limiter-simulation", fork := true, Compile / mainClass := Some("com.example.Driver"))
+  .settings(
+    name := "limiter-simulation",
+    fork := true,
+    Compile / mainClass := Some("com.example.Driver")
+  )
